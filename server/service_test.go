@@ -1185,6 +1185,49 @@ func TestGetPayload(t *testing.T) {
 		require.Equal(t, http.StatusBadGateway, rr.Code, rr.Body.String())
 	})
 
+	t.Run("Returns successful response when one relay fails after max retries reached and another responds", func(t *testing.T) {
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+
+		backend := newTestBackend(t, 2, 2*time.Second)
+
+		// Add the bid to the service
+		bid := bidResp{relays: make([]types.RelayEntry, len(backend.relays))}
+		for i, relay := range backend.relays {
+			bid.relays[i] = relay.RelayEntry
+		}
+		backend.boost.bids[bidKey(payload.Message.Slot, payload.Message.Body.ExecutionPayloadHeader.BlockHash)] = bid
+
+		unresponsiveRelay := backend.relays[0]      // this is the relay which is fast but doesnt respond
+		slowButResponsiveRelay := backend.relays[1] // this is the relay despite being slow actually responds
+		unresponsiveRelay.ResponseDelay = 100 * time.Millisecond
+		slowButResponsiveRelay.ResponseDelay = 1 * time.Second
+
+		count := 0
+		maxRetries := 5
+		unresponsiveRelay.OverrideHandleGetPayload(func(w http.ResponseWriter, req *http.Request) {
+			count++
+			if count > maxRetries {
+				// success response after max retry attempts
+				backend.relays[0].DefaultHandleGetPayload(w, req)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, err := w.Write([]byte(`{"code":500,"message":"internal server error"}`))
+				require.NoError(t, err, "failed to write error response") //nolint:testifylint // if we fail here the test is compromised
+			}
+		})
+		rr := backend.request(t, http.MethodPost, path, header, payload)
+		require.Equal(t, 5, unresponsiveRelay.GetRequestCount(path))
+		require.Equal(t, 1, slowButResponsiveRelay.GetRequestCount(path))
+		require.Equal(t, http.StatusOK, rr.Code)
+
+		resp := new(builderApi.VersionedSubmitBlindedBlockResponse)
+		err := json.Unmarshal(rr.Body.Bytes(), resp)
+		require.NoError(t, err)
+
+		require.Equal(t, payload.Message.Body.ExecutionPayloadHeader.BlockHash, resp.Deneb.ExecutionPayload.BlockHash)
+	})
+
 	t.Run("Requesting payload without getting header", func(t *testing.T) {
 		header := make(http.Header)
 		header.Set(HeaderAccept, MediaTypeJSON)
