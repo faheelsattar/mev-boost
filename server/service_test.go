@@ -1184,6 +1184,51 @@ func TestGetPayload(t *testing.T) {
 		require.JSONEq(t, `{"code":502,"message":"no successful relay response"}`+"\n", rr.Body.String())
 		require.Equal(t, http.StatusBadGateway, rr.Code, rr.Body.String())
 	})
+
+	t.Run("Requesting payload without getting header", func(t *testing.T) {
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+
+		backend := newTestBackend(t, 1, time.Second)
+		rr := backend.request(t, http.MethodPost, path, header, payload)
+		// no bids added to the bid cache since GetHeader request wasnt made resulting in empty bids cache
+		// therefore 502 gets returned and 0 relays get the request.
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+	})
+
+	t.Run("Requesting payload for incorrect slot and blockhash", func(t *testing.T) {
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+
+		backend := newTestBackend(t, 1, time.Second)
+
+		// Simulate a successful GetHeader response by directly populating the bid cache,
+		// without actually making the request.
+		bid := bidResp{relays: make([]types.RelayEntry, len(backend.relays))}
+		for i, relay := range backend.relays {
+			bid.relays[i] = relay.RelayEntry
+		}
+		backend.boost.bids[bidKey(payload.Message.Slot, payload.Message.Body.ExecutionPayloadHeader.BlockHash)] = bid
+
+		// Updating slot only
+		payload.Message.Slot = payload.Message.Slot + 1
+
+		// Request will fail due to cache miss since no bids are stored against this slot
+		rr := backend.request(t, http.MethodPost, path, header, payload)
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+
+		// Updating blockhash aswell
+		newBlockHash := mock.HexToHash("0xa18385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7")
+		payload.Message.Body.ExecutionPayloadHeader.BlockHash = newBlockHash
+
+		// Request will fail again due to cache miss since no bids are stored against
+		// the updated slot and blockhash
+		rr = backend.request(t, http.MethodPost, path, header, payload)
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+	})
 }
 
 func TestCheckRelays(t *testing.T) {
