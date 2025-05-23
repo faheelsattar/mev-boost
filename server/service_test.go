@@ -216,6 +216,48 @@ func TestStatus(t *testing.T) {
 		require.NotEmpty(t, rr.Header().Get("X-MEVBoost-Version"))
 		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
 	})
+
+	t.Run("Relay check disabled", func(t *testing.T) {
+		backend := newTestBackend(t, 1, time.Second)
+		// Since newTestBackend sets relayCheck to true for all requests,
+		// we need to override it to check the status when it is false.
+		backend.boost.relayCheck = false
+
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+		path := "/eth/v1/builder/status"
+
+		rr := backend.request(t, http.MethodGet, path, header, nil)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.NotEmpty(t, rr.Header().Get("X-MEVBoost-Version"))
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+	})
+
+	t.Run("Relay timeout", func(t *testing.T) {
+		backend := newTestBackend(t, 1, 100*time.Millisecond)
+		backend.relays[0].ResponseDelay = 200 * time.Millisecond
+
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+		path := "/eth/v1/builder/status"
+
+		rr := backend.request(t, http.MethodGet, path, header, nil)
+		require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	})
+
+	t.Run("Multiple relays with different timeouts", func(t *testing.T) {
+		backend := newTestBackend(t, 3, 200*time.Millisecond)
+		backend.relays[0].ResponseDelay = 100 * time.Millisecond // Fast
+		backend.relays[1].ResponseDelay = 300 * time.Millisecond // Slow
+		backend.relays[2].ResponseDelay = 150 * time.Millisecond // Medium
+
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+		path := "/eth/v1/builder/status"
+
+		rr := backend.request(t, http.MethodGet, path, header, nil)
+		require.Equal(t, http.StatusOK, rr.Code)
+	})
 }
 
 func TestRegisterValidator(t *testing.T) {
@@ -755,6 +797,127 @@ func TestGetHeaderBids(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, uint256.NewInt(12345), value)
 	})
+
+	t.Run("Use header with highest value with varying relay timeouts", func(t *testing.T) {
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+
+		// Create backend and register 3 relays.
+		backend := newTestBackend(t, 3, time.Second)
+
+		// First relay will return signed response with value 12345.
+		backend.relays[0].GetHeaderResponse = backend.relays[0].MakeGetHeaderResponse(
+			12345,
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249",
+			spec.DataVersionDeneb,
+		)
+		// with fastest respsonse
+		backend.relays[0].ResponseDelay = 100 * time.Millisecond
+
+		// Second relay will return signed response with value 12347.
+		backend.relays[1].GetHeaderResponse = backend.relays[1].MakeGetHeaderResponse(
+			12347,
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249",
+			spec.DataVersionDeneb,
+		)
+		// with slowest respsonse
+		backend.relays[1].ResponseDelay = 300 * time.Millisecond
+
+		// First relay will return signed response with value 12346.
+		backend.relays[2].GetHeaderResponse = backend.relays[2].MakeGetHeaderResponse(
+			12346,
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249",
+			spec.DataVersionDeneb,
+		)
+		// with medium paced respsonse
+		backend.relays[2].ResponseDelay = 200 * time.Millisecond
+
+		// Run the request.
+		rr := backend.request(t, http.MethodGet, path, header, nil)
+
+		// Each relay must have received the request.
+		require.Equal(t, 1, backend.relays[0].GetRequestCount(path))
+		require.Equal(t, 1, backend.relays[1].GetRequestCount(path))
+		require.Equal(t, 1, backend.relays[2].GetRequestCount(path))
+
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+		// Highest value should be 12347, i.e. second relay even
+		// though its response time was the slowest.
+		resp := new(builderSpec.VersionedSignedBuilderBid)
+		err := json.Unmarshal(rr.Body.Bytes(), resp)
+		require.NoError(t, err)
+		value, err := resp.Value()
+		require.NoError(t, err)
+		require.Equal(t, uint256.NewInt(12347), value)
+	})
+
+	t.Run("Highest value bid arrives too late to be accepted", func(t *testing.T) {
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+
+		// Create backend and register 3 relays.
+		backend := newTestBackend(t, 3, time.Second)
+
+		// First relay will return signed response with value 12345.
+		backend.relays[0].GetHeaderResponse = backend.relays[0].MakeGetHeaderResponse(
+			12345,
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249",
+			spec.DataVersionDeneb,
+		)
+		// With fastest respsonse.
+		backend.relays[0].ResponseDelay = 100 * time.Millisecond
+
+		// Second relay will return signed response with value 12347.
+		backend.relays[1].GetHeaderResponse = backend.relays[1].MakeGetHeaderResponse(
+			12347,
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249",
+			spec.DataVersionDeneb,
+		)
+		// With slowest respsonse i.e. too late to be accepted.
+		backend.relays[1].ResponseDelay = 2 * time.Second
+
+		// Third relay will return signed response with value 12346.
+		backend.relays[2].GetHeaderResponse = backend.relays[2].MakeGetHeaderResponse(
+			12346,
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7",
+			"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249",
+			spec.DataVersionDeneb,
+		)
+		// With medium paced respsonse.
+		backend.relays[2].ResponseDelay = 200 * time.Millisecond
+
+		// Run the request.
+		rr := backend.request(t, http.MethodGet, path, header, nil)
+
+		// Each relay must have received the request.
+		require.Equal(t, 1, backend.relays[0].GetRequestCount(path))
+		require.Equal(t, 1, backend.relays[1].GetRequestCount(path))
+		require.Equal(t, 1, backend.relays[2].GetRequestCount(path))
+
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+		// Highest value should be 12346, i.e. third relay.
+		// Even though the highest bid response was from relay 2
+		// it didn't got accepted since it was way too late.
+		resp := new(builderSpec.VersionedSignedBuilderBid)
+		err := json.Unmarshal(rr.Body.Bytes(), resp)
+		require.NoError(t, err)
+		value, err := resp.Value()
+		require.NoError(t, err)
+		require.Equal(t, uint256.NewInt(12346), value)
+	})
 }
 
 func TestGetPayload(t *testing.T) {
@@ -1081,6 +1244,94 @@ func TestGetPayload(t *testing.T) {
 		require.Equal(t, 5, backend.relays[0].GetRequestCount(path))
 		require.JSONEq(t, `{"code":502,"message":"no successful relay response"}`+"\n", rr.Body.String())
 		require.Equal(t, http.StatusBadGateway, rr.Code, rr.Body.String())
+	})
+
+	t.Run("Returns successful response when one relay fails after max retries reached and another responds", func(t *testing.T) {
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+
+		backend := newTestBackend(t, 2, 2*time.Second)
+
+		// Add the bid to the service.
+		bid := bidResp{relays: make([]types.RelayEntry, len(backend.relays))}
+		for i, relay := range backend.relays {
+			bid.relays[i] = relay.RelayEntry
+		}
+		backend.boost.bids[bidKey(payload.Message.Slot, payload.Message.Body.ExecutionPayloadHeader.BlockHash)] = bid
+
+		unresponsiveRelay := backend.relays[0]      // This is the relay which is fast but doesnt respond.
+		slowButResponsiveRelay := backend.relays[1] // This is the relay despite being slow actually responds.
+		unresponsiveRelay.ResponseDelay = 100 * time.Millisecond
+		slowButResponsiveRelay.ResponseDelay = 1 * time.Second
+
+		count := 0
+		maxRetries := 5
+		unresponsiveRelay.OverrideHandleGetPayload(func(w http.ResponseWriter, req *http.Request) {
+			count++
+			if count > maxRetries {
+				// Success response after max retry attempts.
+				backend.relays[0].DefaultHandleGetPayload(w, req)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, err := w.Write([]byte(`{"code":500,"message":"internal server error"}`))
+				require.NoError(t, err, "failed to write error response") //nolint:testifylint // if we fail here the test is compromised
+			}
+		})
+		rr := backend.request(t, http.MethodPost, path, header, payload)
+		require.Equal(t, 5, unresponsiveRelay.GetRequestCount(path))
+		require.Equal(t, 1, slowButResponsiveRelay.GetRequestCount(path))
+		require.Equal(t, http.StatusOK, rr.Code)
+
+		resp := new(builderApi.VersionedSubmitBlindedBlockResponse)
+		err := json.Unmarshal(rr.Body.Bytes(), resp)
+		require.NoError(t, err)
+
+		require.Equal(t, payload.Message.Body.ExecutionPayloadHeader.BlockHash, resp.Deneb.ExecutionPayload.BlockHash)
+	})
+
+	t.Run("Requesting payload without getting header", func(t *testing.T) {
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+
+		backend := newTestBackend(t, 1, time.Second)
+		rr := backend.request(t, http.MethodPost, path, header, payload)
+		// No bids added to the bid cache since GetHeader request wasnt made resulting in empty bids cache
+		// therefore 502 gets returned and 0 relays get the request.
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+	})
+
+	t.Run("Requesting payload for incorrect slot and blockhash", func(t *testing.T) {
+		header := make(http.Header)
+		header.Set(HeaderAccept, MediaTypeJSON)
+
+		backend := newTestBackend(t, 1, time.Second)
+
+		// Simulate a successful GetHeader response by directly populating the bid cache,
+		// without actually making the request.
+		bid := bidResp{relays: make([]types.RelayEntry, len(backend.relays))}
+		for i, relay := range backend.relays {
+			bid.relays[i] = relay.RelayEntry
+		}
+		backend.boost.bids[bidKey(payload.Message.Slot, payload.Message.Body.ExecutionPayloadHeader.BlockHash)] = bid
+
+		// Updating slot only.
+		payload.Message.Slot = payload.Message.Slot + 1
+
+		// Request will fail due to cache miss since no bids are stored against this slot.
+		rr := backend.request(t, http.MethodPost, path, header, payload)
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+
+		// Updating blockhash aswell.
+		newBlockHash := mock.HexToHash("0xa18385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7")
+		payload.Message.Body.ExecutionPayloadHeader.BlockHash = newBlockHash
+
+		// Request will fail again due to cache miss since no bids are stored against
+		// the updated slot and blockhash.
+		rr = backend.request(t, http.MethodPost, path, header, payload)
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
 	})
 }
 
