@@ -219,8 +219,8 @@ func TestStatus(t *testing.T) {
 
 	t.Run("Relay check disabled", func(t *testing.T) {
 		backend := newTestBackend(t, 1, time.Second)
-		// since newTestBackend sets relayCheck to true for all requests,
-		// we need to override it to check the status when it is false
+		// Since newTestBackend sets relayCheck to true for all requests,
+		// we need to override it to check the status when it is false.
 		backend.boost.relayCheck = false
 
 		header := make(http.Header)
@@ -1191,15 +1191,15 @@ func TestGetPayload(t *testing.T) {
 
 		backend := newTestBackend(t, 2, 2*time.Second)
 
-		// Add the bid to the service
+		// Add the bid to the service.
 		bid := bidResp{relays: make([]types.RelayEntry, len(backend.relays))}
 		for i, relay := range backend.relays {
 			bid.relays[i] = relay.RelayEntry
 		}
 		backend.boost.bids[bidKey(payload.Message.Slot, payload.Message.Body.ExecutionPayloadHeader.BlockHash)] = bid
 
-		unresponsiveRelay := backend.relays[0]      // this is the relay which is fast but doesnt respond
-		slowButResponsiveRelay := backend.relays[1] // this is the relay despite being slow actually responds
+		unresponsiveRelay := backend.relays[0]      // This is the relay which is fast but doesnt respond.
+		slowButResponsiveRelay := backend.relays[1] // This is the relay despite being slow actually responds.
 		unresponsiveRelay.ResponseDelay = 100 * time.Millisecond
 		slowButResponsiveRelay.ResponseDelay = 1 * time.Second
 
@@ -1208,7 +1208,7 @@ func TestGetPayload(t *testing.T) {
 		unresponsiveRelay.OverrideHandleGetPayload(func(w http.ResponseWriter, req *http.Request) {
 			count++
 			if count > maxRetries {
-				// success response after max retry attempts
+				// Success response after max retry attempts.
 				backend.relays[0].DefaultHandleGetPayload(w, req)
 			} else {
 				w.WriteHeader(http.StatusInternalServerError)
@@ -1234,7 +1234,7 @@ func TestGetPayload(t *testing.T) {
 
 		backend := newTestBackend(t, 1, time.Second)
 		rr := backend.request(t, http.MethodPost, path, header, payload)
-		// no bids added to the bid cache since GetHeader request wasnt made resulting in empty bids cache
+		// No bids added to the bid cache since GetHeader request wasnt made resulting in empty bids cache
 		// therefore 502 gets returned and 0 relays get the request.
 		require.Equal(t, http.StatusBadGateway, rr.Code)
 		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
@@ -1254,20 +1254,20 @@ func TestGetPayload(t *testing.T) {
 		}
 		backend.boost.bids[bidKey(payload.Message.Slot, payload.Message.Body.ExecutionPayloadHeader.BlockHash)] = bid
 
-		// Updating slot only
+		// Updating slot only.
 		payload.Message.Slot = payload.Message.Slot + 1
 
-		// Request will fail due to cache miss since no bids are stored against this slot
+		// Request will fail due to cache miss since no bids are stored against this slot.
 		rr := backend.request(t, http.MethodPost, path, header, payload)
 		require.Equal(t, http.StatusBadGateway, rr.Code)
 		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
 
-		// Updating blockhash aswell
+		// Updating blockhash aswell.
 		newBlockHash := mock.HexToHash("0xa18385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7")
 		payload.Message.Body.ExecutionPayloadHeader.BlockHash = newBlockHash
 
 		// Request will fail again due to cache miss since no bids are stored against
-		// the updated slot and blockhash
+		// the updated slot and blockhash.
 		rr = backend.request(t, http.MethodPost, path, header, payload)
 		require.Equal(t, http.StatusBadGateway, rr.Code)
 		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
