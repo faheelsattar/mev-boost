@@ -40,15 +40,23 @@ jobs:
         VERSION=${{ env.KURTOSIS_VERSION }}
         echo "Installing Kurtosis CLI version $VERSION"
 
-        # Use the official installation method
-        curl -L "https://github.com/kurtosis-tech/kurtosis/releases/download/v${VERSION}/kurtosis-cli_v${VERSION}_linux_amd64.tar.gz" -o kurtosis.tar.gz
+        # Download from the correct repository: kurtosis-cli-release-artifacts
+        curl -L "https://github.com/kurtosis-tech/kurtosis-cli-release-artifacts/releases/download/${VERSION}/kurtosis-cli_${VERSION}_linux_amd64.tar.gz" -o kurtosis.tar.gz
         
+        # Check if download was successful
         if [ ! -f kurtosis.tar.gz ] || [ ! -s kurtosis.tar.gz ]; then
           echo "Error: Failed to download Kurtosis CLI version $VERSION"
-          echo "Trying alternative download method..."
+          echo "Trying latest version as fallback..."
           
-          # Alternative: use the latest version
-          curl -L "https://github.com/kurtosis-tech/kurtosis/releases/latest/download/kurtosis-cli_linux_amd64.tar.gz" -o kurtosis.tar.gz
+          # Alternative: use the latest version from the correct repository
+          curl -L "https://github.com/kurtosis-tech/kurtosis-cli-release-artifacts/releases/latest/download/kurtosis-cli_linux_amd64.tar.gz" -o kurtosis.tar.gz
+        fi
+
+        # Verify the downloaded file is a valid gzip archive
+        if ! file kurtosis.tar.gz | grep -q "gzip compressed"; then
+          echo "Downloaded file is not a valid gzip archive. Content:"
+          cat kurtosis.tar.gz
+          exit 1
         fi
 
         tar -xzf kurtosis.tar.gz
