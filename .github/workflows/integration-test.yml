@@ -8,7 +8,7 @@ on:
 
 env:
   TEST_TIMEOUT: 300s
-  KURTOSIS_VERSION: 0.89.2
+  KURTOSIS_VERSION: 1.11.1
 
 jobs:
   integration-test:
@@ -38,7 +38,8 @@ jobs:
     - name: Install Kurtosis CLI
       run: |
         echo "Installing Kurtosis CLI version ${{ env.KURTOSIS_VERSION }}"
-        curl -L "https://github.com/kurtosis-tech/kurtosis/releases/download/${{ env.KURTOSIS_VERSION }}/kurtosis-cli_${{ env.KURTOSIS_VERSION }}_linux_amd64.tar.gz" | tar -xz
+        curl -L "https://github.com/kurtosis-tech/kurtosis/releases/download/${{ env.KURTOSIS_VERSION }}/kurtosis_${{ env.KURTOSIS_VERSION }}_linux_amd64" -o kurtosis
+        chmod +x kurtosis
         sudo mv kurtosis /usr/local/bin/
         kurtosis version
 
