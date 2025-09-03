@@ -1,0 +1,272 @@
+name: MEV-Boost Integration Tests
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+
+env:
+  TEST_TIMEOUT: 300s
+  KURTOSIS_VERSION: 1.11.1
+
+jobs:
+  integration-test:
+    name: "Integration Test"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - name: Checkout mev-boost
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24'
+        cache: true
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Install Docker Compose
+      run: |
+        sudo curl -L "https://github.com/docker/compose/releases/download/v2.21.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
+        docker-compose --version
+
+    - name: Install Kurtosis CLI
+      run: |
+        VERSION=${{ env.KURTOSIS_VERSION }}
+        echo "Installing Kurtosis CLI version $VERSION"
+
+        # Download from the correct repository: kurtosis-cli-release-artifacts
+        curl -L "https://github.com/kurtosis-tech/kurtosis-cli-release-artifacts/releases/download/${VERSION}/kurtosis-cli_${VERSION}_linux_amd64.tar.gz" -o kurtosis.tar.gz
+        
+        # Check if download was successful
+        if [ ! -f kurtosis.tar.gz ] || [ ! -s kurtosis.tar.gz ]; then
+          echo "Error: Failed to download Kurtosis CLI version $VERSION"
+          echo "Trying latest version as fallback..."
+          
+          # Alternative: use the latest version from the correct repository
+          curl -L "https://github.com/kurtosis-tech/kurtosis-cli-release-artifacts/releases/latest/download/kurtosis-cli_linux_amd64.tar.gz" -o kurtosis.tar.gz
+        fi
+
+        # Verify the downloaded file is a valid gzip archive
+        if ! file kurtosis.tar.gz | grep -q "gzip compressed"; then
+          echo "Downloaded file is not a valid gzip archive. Content:"
+          cat kurtosis.tar.gz
+          exit 1
+        fi
+
+        tar -xzf kurtosis.tar.gz
+        chmod +x kurtosis
+        sudo mv kurtosis /usr/local/bin/
+        kurtosis version
+
+    - name: Start Kurtosis Engine
+      run: |
+        echo "Starting Kurtosis engine..."
+        kurtosis engine start
+        
+        # Wait for engine to be ready
+        for i in {1..30}; do
+          if kurtosis engine status | grep -q "Running"; then
+            echo "Kurtosis engine is ready"
+            break
+          fi
+          echo "Waiting for Kurtosis engine to start... ($i/30)"
+          sleep 2
+        done
+
+    - name: Build MEV-Boost Docker image
+      run: |
+        docker build -t my-mev-boost:latest .
+
+    - name: Create Kurtosis test configuration
+      run: |
+        cat > test-run.yml << 'EOF'
+        participants:
+          - el_type: geth
+            el_image: ethpandaops/geth:fusaka-devnet-3
+            cl_type: lighthouse
+            cl_image: ethpandaops/lighthouse:fusaka-devnet-3
+            vc_image: ethpandaops/lighthouse:fusaka-devnet-3
+            supernode: true
+            count: 2
+
+        additional_services:
+          - dora
+          - tx_fuzz
+          - spamoor
+          - assertoor
+
+        mev_type: flashbots
+        mev_params:
+          mev_relay_image: ethpandaops/mev-boost-relay:bharath-123-fusaka-devnet-3
+          mev_builder_image: ethpandaops/mev-boost:bharath-123-fusaka-devnet-3
+          mev_boost_image: my-mev-boost:latest
+          mev_builder_cl_image: ethpandaops/lighthouse:fusaka-devnet-3
+          mev_builder_subsidy: 1
+
+        spamoor_params:
+          spammers:
+             - name: "Blob Spammer (Kurtosis Package)"
+               description: "3 type-4 blob transactions per slot with 1-2 sidecars each, gas/blobgas limit 20 gwei"
+               scenario: "blobs"
+               config:
+                 throughput: 10
+
+             - name: "ERC txs"
+               description: "ERC txs"
+               scenario: "erctx"
+               config:
+                 throughput: 100
+
+        network_params:
+          min_validator_withdrawability_delay: 1
+          shard_committee_period: 1
+          churn_limit_quotient: 16
+          fulu_fork_epoch: 2
+          num_validator_keys_per_node: 64
+          preregistered_validator_keys_mnemonic:
+            "giant issue aisle success illegal bike spike
+            question tent bar rely arctic volcano long crawl hungry vocal artwork sniff fantasy
+            very lucky have athlete"
+          preregistered_validator_count: 0
+          prefunded_accounts: '{"0xb9e79d19f651a941757b35830232e7efc77e1c79": {"balance": "100000ETH"}}'
+
+        port_publisher:
+          cl:
+            enabled: true
+            public_port_start: 33000
+
+          el:
+            enabled: true
+            public_port_start: 32000
+
+          vc:
+            enabled: true
+            public_port_start: 31000
+
+          additional_services:
+            enabled: true
+            public_port_start: 36000
+          mev:
+            enabled: true
+            public_port_start: 37000
+          other:
+            enabled: true
+            public_port_start: 38000
+        EOF
+
+    - name: Start Ethereum testnet with Kurtosis
+      run: |
+        echo "Starting Ethereum testnet with Kurtosis..."
+        
+        # Run the ethereum package with our configuration
+        kurtosis run github.com/ethpandaops/ethereum-package --args-file test-run.yml --enclave ethereum-testnet
+        
+        echo "Ethereum testnet started successfully"
+        
+        # List running enclaves to verify
+        kurtosis enclave ls
+        
+        # Get service information
+        kurtosis service ls ethereum-testnet
+
+    - name: Wait for services to be ready
+      run: |
+        echo "Waiting for services to be ready..."
+        
+        # Wait for MEV-Boost to be ready
+        for i in {1..60}; do
+          if kurtosis service logs ethereum-testnet mev-boost-0 --follow=false | grep -q "started"; then
+            echo "MEV-Boost is ready"
+            break
+          fi
+          echo "Waiting for MEV-Boost... ($i/60)"
+          sleep 5
+        done
+        
+        # Wait for execution layer to be ready
+        for i in {1..60}; do
+          if curl -s -X POST -H "Content-Type: application/json" \
+            --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+            http://localhost:32000 > /dev/null 2>&1; then
+            echo "Execution layer is ready"
+            break
+          fi
+          echo "Waiting for execution layer... ($i/60)"
+          sleep 5
+        done
+        
+        # Wait for beacon node to be ready
+        for i in {1..60}; do
+          if curl -s http://localhost:33000/eth/v1/beacon/headers/head > /dev/null 2>&1; then
+            echo "Beacon node is ready"
+            break
+          fi
+          echo "Waiting for beacon node... ($i/60)"
+          sleep 5
+        done
+        
+        echo "All services are ready!"
+
+    - name: Run mev-boost integration tests
+      run: |
+        echo "Running MEV-boost integration tests..."
+        
+        # Set environment variables for tests
+        export MEV_BOOST_URL="http://localhost:37000"
+        export BEACON_NODE_URL="http://localhost:33000"
+        export RELAY_URL="http://localhost:37001"
+        export EXECUTION_URL="http://localhost:32000"
+        
+        echo "Running mev-boost integration tests..."
+        
+        # Run the integration tests with timeout
+        timeout ${{ env.TEST_TIMEOUT }} go test -v ./server -run TestMEVBoostIntegration -timeout=10m
+        TEST_EXIT_CODE=$?
+        
+        if [ $TEST_EXIT_CODE -eq 0 ]; then
+          echo "Integration tests passed!"
+        else
+          echo "Integration tests failed with exit code $TEST_EXIT_CODE"
+          exit $TEST_EXIT_CODE
+        fi
+
+    - name: Debug - Show Kurtosis logs on failure
+      if: failure()
+      run: |
+        echo "=== Kurtosis enclave status ==="
+        kurtosis enclave ls
+        
+        echo "=== Kurtosis service logs ==="
+        kurtosis service ls ethereum-testnet || true
+        
+        echo "=== MEV-Boost logs ==="
+        kurtosis service logs ethereum-testnet mev-boost-0 --follow=false || true
+        
+        echo "=== Execution layer logs ==="
+        kurtosis service logs ethereum-testnet el-0-geth --follow=false || true
+        
+        echo "=== Beacon node logs ==="
+        kurtosis service logs ethereum-testnet cl-0-lighthouse-geth --follow=false || true
+
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "Cleaning up Kurtosis resources..."
+        
+        # Stop and remove the enclave
+        kurtosis enclave stop ethereum-testnet || true
+        kurtosis enclave rm ethereum-testnet --force || true
+        
+        # Stop Kurtosis engine
+        kurtosis engine stop || true
+        
+        # Clean up Docker resources
+        docker system prune -f || true
+        
+        echo "Cleanup completed"
