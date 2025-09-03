@@ -37,9 +37,25 @@ jobs:
 
     - name: Install Kurtosis CLI
       run: |
-        echo "Installing Kurtosis CLI version ${{ env.KURTOSIS_VERSION }}"
-        curl -L "https://github.com/kurtosis-tech/kurtosis/releases/download/${{ env.KURTOSIS_VERSION }}/kurtosis_${{ env.KURTOSIS_VERSION }}_linux_amd64.tar.gz" -o kurtosis.tar.gz
-        tar -xzf kurtosis.tar.gz
+        VERSION=${{ env.KURTOSIS_VERSION }}
+        echo "Attempting to download Kurtosis CLI version $VERSION"
+
+        BASE_URL="https://github.com/kurtosis-tech/kurtosis/releases/download/$VERSION"
+        BINARY_NAME="kurtosis_${VERSION}_linux_amd64"
+        TARBALL="${BINARY_NAME}.tar.gz"
+
+        # Try downloading the raw binary first
+        if curl -fsSL "$BASE_URL/$BINARY_NAME" -o kurtosis; then
+          echo "Downloaded binary for version $VERSION"
+        elif curl -fsSL "$BASE_URL/$TARBALL" -o kurtosis.tar.gz; then
+          echo "Downloaded tarball for version $VERSION; extracting..."
+          tar -xzvf kurtosis.tar.gz
+        else
+          echo "Error: Neither binary nor tarball available for version $VERSION"
+          exit 1
+        fi
+
+        chmod +x kurtosis
         sudo mv kurtosis /usr/local/bin/
         kurtosis version
 
