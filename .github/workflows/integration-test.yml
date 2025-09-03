@@ -82,13 +82,6 @@ jobs:
     - name: Build MEV-Boost Docker image
       run: |
         docker build -t my-mev-boost:latest .
-    - name: Clone builder-playground
-      run: |
-        # Create a placeholder reth-rbuilder image for testing
-        # In a real scenario, you would build your actual rbuilder image here
-        echo "FROM alpine:latest" > Dockerfile.rbuilder
-        echo "CMD sleep 3600" >> Dockerfile.rbuilder
-        docker build -f Dockerfile.rbuilder -t local/reth-rbuilder:latest .
 
     - name: Create Kurtosis test configuration
       run: |
