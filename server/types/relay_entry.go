@@ -13,6 +13,7 @@ type RelayEntry struct {
 	PublicKey   phase0.BLSPubKey
 	URL         *url.URL
 	SupportsSSZ bool
+	AuthData    string
 }
 
 type RelayConfig struct {
@@ -91,6 +92,7 @@ func RelayEntriesToStrings(relays []RelayEntry) []string {
 func (r *RelayEntry) Copy() (ret RelayEntry) {
 	ret.PublicKey = r.PublicKey
 	ret.SupportsSSZ = r.SupportsSSZ
+	ret.AuthData = r.AuthData
 	if r.URL != nil {
 		urlCopy := *r.URL
 		ret.URL = &urlCopy
