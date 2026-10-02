@@ -1,6 +1,7 @@
 package types
 
 import (
+	"fmt"
 	"net/url"
 	"strings"
 
@@ -107,4 +108,18 @@ func (r *RelayEntry) Copy() (ret RelayEntry) {
 		ret.URL = &urlCopy
 	}
 	return
+}
+
+// ValidateUniqueAuthData returns an error if two relays in the set
+// expect the same auth data.
+func ValidateUniqueAuthData(configs []RelayConfig) error {
+	exists := make(map[string]string, len(configs))
+	for _, c := range configs {
+		key := c.RelayEntry.AuthData
+		if other, ok := exists[key]; ok {
+			return fmt.Errorf("%w: %s and %s (%q)", ErrDuplicateAuthData, other, c.RelayEntry.String(), key)
+		}
+		exists[key] = c.RelayEntry.String()
+	}
+	return nil
 }

@@ -156,6 +156,10 @@ func MergeRelayConfigs(relays []types.RelayEntry, configMap map[string]types.Rel
 		return nil, errNoRelaysSpecified
 	}
 
+	if err := types.ValidateUniqueAuthData(configs); err != nil {
+		return nil, err
+	}
+
 	return configs, nil
 }
 
