@@ -6,6 +6,7 @@ import (
 
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/flashbots/go-boost-utils/utils"
+	"github.com/flashbots/mev-boost/server/types/gloas"
 )
 
 // RelayEntry represents a relay that mev-boost connects to.
@@ -75,6 +76,14 @@ func NewRelayEntry(relayURL string) (entry RelayEntry, err error) {
 	if entry.PublicKey.IsInfinity() {
 		return entry, ErrPointAtInfinityPubkey
 	}
+
+	// relays hostname is defaulted as the auth_data. This is overriden by a
+	// value that was agreed by the relay and is already set in the YAML config.
+	authData, err := gloas.DefaultAuthData(entry.URL.String())
+	if err != nil {
+		return entry, err
+	}
+	entry.AuthData = string(authData)
 
 	return entry, nil
 }
