@@ -191,6 +191,64 @@ func (m *BoostService) handleSubmitBuilderPreferences(w http.ResponseWriter, req
 	respondRelayResponse(w, params.PathSubmitBuilderPreferences, resp)
 }
 
+func (m *BoostService) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req *http.Request) {
+	log := m.log.WithFields(logrus.Fields{
+		"method": "submitSignedBeaconBlock",
+		"ua":     req.Header.Get(HeaderUserAgent),
+	})
+	log.Debug("handling request")
+
+	if req.Header.Get(HeaderEthConsensusVersion) != EthConsensusVersionGloas {
+		m.respondGloasError(w, log, params.PathSubmitSignedBeaconBlock, http.StatusBadRequest, errGloasConsensusVersion)
+		return
+	}
+	contentType, err := requestContentType(req.Header)
+	if err != nil {
+		m.respondGloasError(w, log, params.PathSubmitSignedBeaconBlock, http.StatusUnsupportedMediaType, err)
+		return
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		m.respondGloasError(w, log, params.PathSubmitSignedBeaconBlock, http.StatusBadRequest, err)
+		return
+	}
+	if len(body) == 0 {
+		m.respondGloasError(w, log, params.PathSubmitSignedBeaconBlock, http.StatusBadRequest, errMissingBody)
+		return
+	}
+
+	m.relayConfigsLock.RLock()
+	relays := relayEntries(m.AllRelayConfigs())
+	m.relayConfigsLock.RUnlock()
+
+	header := gloasForwardHeader(req, contentType)
+	acceptedCh := make(chan bool, len(relays))
+
+	// we are forwarding the request to all the relays here just to avoid to store
+	// the relays whos bid was requested for and then somehow getting data lost in
+	// cache maybe due to restart. Only the relay whose bid won accepts it.
+	for _, relay := range relays {
+		go func(relay types.RelayEntry) {
+			resp := m.forwardGloasRequest(log, &m.httpClientGetPayload, relay, params.PathSubmitSignedBeaconBlock, params.PathSubmitSignedBeaconBlock, body, header, m.httpClientGetPayload.Timeout)
+			accepted := resp != nil && resp.status == http.StatusAccepted
+			if resp != nil && !accepted {
+				log.WithFields(logrus.Fields{"relay": relay.String(), "statusCode": resp.status}).Debug("relay did not accept the block")
+			}
+			acceptedCh <- accepted
+		}(relay)
+	}
+
+	for range relays {
+		if <-acceptedCh {
+			log.Info("signed beacon block accepted by relay")
+			IncrementBeaconNodeStatus(strconv.Itoa(http.StatusAccepted), params.PathSubmitSignedBeaconBlock)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+	}
+	m.respondGloasError(w, log, params.PathSubmitSignedBeaconBlock, http.StatusBadGateway, errNoSuccessfulRelayResponse)
+}
+
 // decodeGloasRequest checks the consensus version header and decodes the body.
 func decodeGloasRequest(req *http.Request, dst gloasBody) (body []byte, contentType string, code int, err error) {
 	if req.Header.Get(HeaderEthConsensusVersion) != EthConsensusVersionGloas {
