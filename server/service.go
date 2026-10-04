@@ -182,6 +182,11 @@ func (m *BoostService) getRouter() http.Handler {
 	r.HandleFunc(params.PathGetPayload, m.handleGetPayload).Methods(http.MethodPost)
 	r.HandleFunc(params.PathGetPayloadV2, m.handleGetPayloadV2).Methods(http.MethodPost)
 
+	// gloas handlers
+	r.HandleFunc(params.PathGetExecutionPayloadBid, m.handleGetExecutionPayloadBid).Methods(http.MethodPost)
+	r.HandleFunc(params.PathSubmitBuilderPreferences, m.handleSubmitBuilderPreferences).Methods(http.MethodPost)
+	r.HandleFunc(params.PathSubmitSignedBeaconBlock, m.handleSubmitSignedBeaconBlock).Methods(http.MethodPost)
+
 	r.Use(mux.CORSMethodMiddleware(r))
 	loggedRouter := httplogger.LoggingMiddlewareLogrus(m.log, r)
 	return loggedRouter
