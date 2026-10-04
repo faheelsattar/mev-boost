@@ -1,0 +1,420 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"mime"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	builderApiGloas "github.com/attestantio/go-builder-client/api/gloas"
+	"github.com/attestantio/go-eth2-client/spec/gloas"
+	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/flashbots/go-boost-utils/utils"
+	"github.com/flashbots/mev-boost/config"
+	"github.com/flashbots/mev-boost/server/params"
+	"github.com/flashbots/mev-boost/server/types"
+	gloasAPI "github.com/flashbots/mev-boost/server/types/gloas"
+	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
+)
+
+// Gloas (ePBS) builder API. Each request is forwarded unchanged to the one relay whose
+// auth data matches the request, and the relay's response is passed back.
+
+var (
+	errGloasConsensusVersion = errors.New("Eth-Consensus-Version header must be gloas")
+	errMissingTimingHeaders  = errors.New("missing or invalid Date-Milliseconds or X-Timeout-Ms header")
+	errMissingBody           = errors.New("missing request body")
+	errAuthDataMismatch      = errors.New("auth data does not match any configured relay")
+	errAuthSlotMismatch      = errors.New("auth slot does not match the request slot")
+	errAuthSlotPassed        = errors.New("auth slot has already passed")
+	errAuthSignature         = errors.New("request auth signature verification failed")
+)
+
+type gloasBody interface {
+	UnmarshalSSZ([]byte) error
+	UnmarshalJSON([]byte) error
+}
+
+type relayResponse struct {
+	status           int
+	body             []byte
+	contentType      string
+	consensusVersion string
+}
+
+func (m *BoostService) handleGetExecutionPayloadBid(w http.ResponseWriter, req *http.Request) {
+	var (
+		vars           = mux.Vars(req)
+		slotStr        = vars["slot"]
+		parentHashHex  = vars["parent_hash"]
+		parentRootHex  = vars["parent_root"]
+		proposerPubkey = vars["proposer_pubkey"]
+	)
+	log := m.log.WithFields(logrus.Fields{
+		"method":         "getExecutionPayloadBid",
+		"slot":           slotStr,
+		"parentHash":     parentHashHex,
+		"parentRoot":     parentRootHex,
+		"proposerPubkey": proposerPubkey,
+		"ua":             req.Header.Get(HeaderUserAgent),
+	})
+	log.Debug("handling request")
+
+	slotValue, err := strconv.ParseUint(slotStr, 10, 64)
+	if err != nil {
+		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadRequest, errInvalidSlot)
+		return
+	}
+	slot := phase0.Slot(slotValue)
+	if len(parentHashHex) != 66 || len(parentRootHex) != 66 {
+		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadRequest, errInvalidHash)
+		return
+	}
+	deadline, err := requestDeadline(req.Header)
+	if err != nil {
+		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadRequest, err)
+		return
+	}
+
+	auth := new(builderApiGloas.SignedBuilderRequestAuth)
+	body, contentType, code, err := decodeGloasRequest(req, auth)
+	if err != nil {
+		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, code, err)
+		return
+	}
+	if err := validateAuth(auth); err != nil {
+		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadRequest, err)
+		return
+	}
+	if auth.Message.Slot != slot {
+		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadRequest, errAuthSlotMismatch)
+		return
+	}
+
+	relay, code, err := m.authorizeGloasRequest(proposerPubkey, auth)
+	if err != nil {
+		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, code, err)
+		return
+	}
+	log = log.WithField("relay", relay.RelayEntry.String())
+
+	// a bid arriving later cannot make it into a block published before
+	// the attestation deadline.
+	m.relayConfigsLock.RLock()
+	_, _, lateInSlotTimeMs := m.GetConfigForValidator(proposerPubkey)
+	m.relayConfigsLock.RUnlock()
+	slotStart := time.Unix(int64(m.genesisTime+uint64(slot)*config.SlotTimeSec), 0)
+	deadline = time.UnixMilli(min(deadline.UnixMilli(), slotStart.UnixMilli()+int64(lateInSlotTimeMs)))
+
+	if time.Until(deadline) <= 0 {
+		log.Warn("proposer deadline already passed, not requesting a bid")
+		IncrementBeaconNodeStatus(strconv.Itoa(http.StatusNoContent), params.PathGetExecutionPayloadBid)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	path := fmt.Sprintf("/eth/v1/builder/execution_payload_bid/%d/%s/%s/%s", slot, parentHashHex, parentRootHex, proposerPubkey)
+	header := gloasForwardHeader(req, contentType)
+	send := func(timeout time.Duration) *relayResponse {
+		return m.forwardGloasRequest(log, &m.httpClientGetHeader, relay.RelayEntry, params.PathGetExecutionPayloadBid, path, body, header, timeout)
+	}
+
+	var resp *relayResponse
+	if relay.EnableTimingGames {
+		resp = pollUntilDeadline(relay, slotStart, deadline, send)
+	} else {
+		resp = send(time.Until(deadline))
+	}
+	if resp == nil {
+		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadGateway, errNoSuccessfulRelayResponse)
+		return
+	}
+	if resp.status == http.StatusOK {
+		logExecutionPayloadBid(log, relay.RelayEntry, resp)
+	} else {
+		log.WithField("statusCode", resp.status).Info("no bid from relay")
+	}
+	respondRelayResponse(w, params.PathGetExecutionPayloadBid, resp)
+}
+
+// decodeGloasRequest checks the consensus version header and decodes the body.
+func decodeGloasRequest(req *http.Request, dst gloasBody) (body []byte, contentType string, code int, err error) {
+	if req.Header.Get(HeaderEthConsensusVersion) != EthConsensusVersionGloas {
+		return nil, "", http.StatusBadRequest, errGloasConsensusVersion
+	}
+	contentType, err = requestContentType(req.Header)
+	if err != nil {
+		return nil, "", http.StatusUnsupportedMediaType, err
+	}
+	body, err = io.ReadAll(req.Body)
+	if err != nil {
+		return nil, "", http.StatusBadRequest, err
+	}
+	if len(body) == 0 {
+		return nil, "", http.StatusBadRequest, errMissingBody
+	}
+	if contentType == MediaTypeOctetStream {
+		err = dst.UnmarshalSSZ(body)
+	} else {
+		err = dst.UnmarshalJSON(body)
+	}
+	if err != nil {
+		return nil, "", http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err)
+	}
+	return body, contentType, 0, nil
+}
+
+// validateAuth checks the container limits.
+func validateAuth(auth *builderApiGloas.SignedBuilderRequestAuth) error {
+	if auth == nil || auth.Message == nil {
+		return gloasAPI.ErrNilMessage
+	}
+	if len(auth.Message.Data) == 0 {
+		return gloasAPI.ErrEmptyAuthData
+	}
+	if len(auth.Message.Data) > gloasAPI.MaxBuilderAuthDataSize {
+		return gloasAPI.ErrAuthDataTooLarge
+	}
+	return nil
+}
+
+// authorizeGloasRequest finds the relay the request is addressed to and verifies the proposers signature.
+func (m *BoostService) authorizeGloasRequest(proposerPubkey string, auth *builderApiGloas.SignedBuilderRequestAuth) (types.RelayConfig, int, error) {
+	pubkey, err := utils.HexToPubkey(proposerPubkey)
+	if err != nil {
+		return types.RelayConfig{}, http.StatusBadRequest, errInvalidPubkey
+	}
+
+	m.relayConfigsLock.RLock()
+	relayConfigs, _, _ := m.GetConfigForValidator(proposerPubkey)
+	m.relayConfigsLock.RUnlock()
+
+	var relay *types.RelayConfig
+	for i := range relayConfigs {
+		if relayConfigs[i].RelayEntry.AuthData == string(auth.Message.Data) {
+			relay = &relayConfigs[i]
+			break
+		}
+	}
+	if relay == nil {
+		return types.RelayConfig{}, http.StatusBadRequest, errAuthDataMismatch
+	}
+
+	ok, err := gloasAPI.Verify(auth, pubkey, m.requestAuthDomain)
+	if err != nil {
+		return types.RelayConfig{}, http.StatusUnauthorized, err
+	}
+	if !ok {
+		return types.RelayConfig{}, http.StatusUnauthorized, errAuthSignature
+	}
+	return *relay, 0, nil
+}
+
+// forwardGloasRequest posts the body to the relay and returns its response
+func (m *BoostService) forwardGloasRequest(log *logrus.Entry, client *http.Client, relay types.RelayEntry, endpoint, path string, body []byte, header http.Header, timeout time.Duration) *relayResponse {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	url := relay.GetURI(path)
+	log = log.WithField("url", url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		log.WithError(err).Warn("error creating request")
+		return nil
+	}
+	maps.Copy(req.Header, header)
+	req.Header.Set(HeaderDateMilliseconds, strconv.FormatInt(time.Now().UTC().UnixMilli(), 10))
+	req.Header.Set(HeaderTimeoutMs, strconv.FormatInt(timeout.Milliseconds(), 10))
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	RecordRelayLatency(endpoint, relay.URL.Hostname(), float64(time.Since(start).Milliseconds()))
+	if err != nil {
+		log.WithError(err).Warn("error calling relay")
+		return nil
+	}
+	defer resp.Body.Close()
+	RecordRelayStatusCode(strconv.Itoa(resp.StatusCode), endpoint, relay.URL.Hostname())
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.WithError(err).Warn("error reading relay response")
+		return nil
+	}
+	if resp.StatusCode >= http.StatusInternalServerError {
+		log.WithFields(logrus.Fields{"statusCode": resp.StatusCode, "body": string(respBody)}).Warn("relay error response")
+		return nil
+	}
+	return &relayResponse{
+		status:           resp.StatusCode,
+		body:             respBody,
+		contentType:      resp.Header.Get(HeaderContentType),
+		consensusVersion: resp.Header.Get(HeaderEthConsensusVersion),
+	}
+}
+
+// pollUntilDeadline implements timing games for a relay, it waits for the configured first request
+// time, then requests repeatedly until the deadline and returns the most recently sent successful response.
+func pollUntilDeadline(relay types.RelayConfig, slotStart, deadline time.Time, send func(time.Duration) *relayResponse) *relayResponse {
+	if relay.TargetFirstRequestMs > 0 {
+		target := slotStart.Add(time.Duration(relay.TargetFirstRequestMs) * time.Millisecond)
+		// target still in future and before the deadline.
+		// todo: test scenario where the target is only a few milliseconds before the deadline
+		// cuz it will send the req to the relay/builder with a near zero budget.
+		// maybe we can add a min budget floor later....
+		if target.Before(deadline) && time.Now().Before(target) {
+			time.Sleep(time.Until(target))
+		}
+	}
+	if relay.FrequencyGetHeaderMs == 0 {
+		return send(time.Until(deadline))
+	}
+
+	var (
+		mu         sync.Mutex
+		wg         sync.WaitGroup
+		latest     *relayResponse
+		latestSent time.Time
+		fallback   *relayResponse
+	)
+	poll := func() {
+		defer wg.Done()
+		sent := time.Now()
+		remaining := deadline.Sub(sent)
+		if remaining <= 0 {
+			return
+		}
+		resp := send(remaining)
+		if resp == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if resp.status != http.StatusOK {
+			fallback = resp
+			return
+		}
+		if sent.After(latestSent) {
+			latest, latestSent = resp, sent
+		}
+	}
+
+	frequency := time.Duration(relay.FrequencyGetHeaderMs) * time.Millisecond
+	wg.Add(1)
+	go poll()
+	ticker := time.NewTicker(frequency)
+	defer ticker.Stop()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if time.Until(deadline) > frequency {
+				wg.Add(1)
+				go poll()
+			}
+		case <-timer.C:
+			wg.Wait()
+			if latest != nil {
+				return latest
+			}
+			return fallback
+		}
+	}
+}
+
+func logExecutionPayloadBid(log *logrus.Entry, relay types.RelayEntry, resp *relayResponse) {
+	bid := new(gloas.SignedExecutionPayloadBid)
+	var err error
+	if contentType, _, _ := mime.ParseMediaType(resp.contentType); contentType == MediaTypeOctetStream {
+		err = bid.UnmarshalSSZ(resp.body)
+	} else {
+		err = bid.UnmarshalJSON(resp.body)
+	}
+	if err != nil || bid.Message == nil {
+		log.WithError(err).Warn("could not decode bid from relay")
+		return
+	}
+	total := bid.Message.Value + bid.Message.ExecutionPayment
+	if total < bid.Message.Value {
+		total = ^phase0.Gwei(0)
+	}
+	RecordBidValue(relay.URL.Hostname(), float64(total)/1e9)
+	RecordRelayLastSlot(relay.URL.Hostname(), uint64(bid.Message.Slot))
+	log.WithFields(logrus.Fields{
+		"blockHash":            bid.Message.BlockHash.String(),
+		"builderIndex":         bid.Message.BuilderIndex,
+		"valueGwei":            bid.Message.Value,
+		"executionPaymentGwei": bid.Message.ExecutionPayment,
+	}).Info("bid received")
+}
+
+func respondRelayResponse(w http.ResponseWriter, endpoint string, resp *relayResponse) {
+	IncrementBeaconNodeStatus(strconv.Itoa(resp.status), endpoint)
+	if resp.contentType != "" {
+		w.Header().Set(HeaderContentType, resp.contentType)
+	}
+	if resp.consensusVersion != "" {
+		w.Header().Set(HeaderEthConsensusVersion, resp.consensusVersion)
+	} else if resp.status == http.StatusOK {
+		w.Header().Set(HeaderEthConsensusVersion, EthConsensusVersionGloas)
+	}
+	w.WriteHeader(resp.status)
+	if len(resp.body) > 0 {
+		w.Write(resp.body)
+	}
+}
+
+func (m *BoostService) respondGloasError(w http.ResponseWriter, log *logrus.Entry, endpoint string, code int, err error) {
+	log.WithError(err).WithField("statusCode", code).Warn("rejecting request")
+	IncrementBeaconNodeStatus(strconv.Itoa(code), endpoint)
+	m.respondError(w, code, err.Error())
+}
+
+func gloasForwardHeader(req *http.Request, contentType string) http.Header {
+	header := http.Header{}
+	header.Set(HeaderContentType, contentType)
+	if accept := req.Header.Get(HeaderAccept); accept != "" {
+		header.Set(HeaderAccept, accept)
+	}
+	header.Set(HeaderEthConsensusVersion, EthConsensusVersionGloas)
+	header.Set(HeaderUserAgent, wrapUserAgent(UserAgent(req.Header.Get(HeaderUserAgent))))
+	return header
+}
+
+// requestDeadline returns the proposers deadline, Date-Milliseconds + X-Timeout-Ms.
+func requestDeadline(header http.Header) (time.Time, error) {
+	date, err := strconv.ParseInt(header.Get(HeaderDateMilliseconds), 10, 64)
+	if err != nil {
+		return time.Time{}, errMissingTimingHeaders
+	}
+	timeout, err := strconv.ParseInt(header.Get(HeaderTimeoutMs), 10, 64)
+	if err != nil || timeout <= 0 {
+		return time.Time{}, errMissingTimingHeaders
+	}
+	return time.UnixMilli(date + timeout), nil
+}
+
+func requestContentType(header http.Header) (string, error) {
+	raw := header.Get(HeaderContentType)
+	if raw == "" {
+		return MediaTypeJSON, nil
+	}
+	mediaType, _, err := mime.ParseMediaType(raw)
+	if err != nil {
+		return "", err
+	}
+	switch mediaType {
+	case MediaTypeJSON, MediaTypeOctetStream:
+		return mediaType, nil
+	}
+	return "", types.ErrInvalidContentType
+}

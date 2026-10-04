@@ -18,6 +18,7 @@ var (
 	ErrEmptyAuthData    = errors.New("auth data must not be empty")
 	ErrAuthDataTooLarge = fmt.Errorf("auth data exceeds %d bytes", MaxBuilderAuthDataSize)
 	ErrMissingHostname  = errors.New("url has no hostname")
+	ErrNilMessage       = errors.New("nil message")
 )
 
 func ParseAuthData(s string) ([]byte, error) {
