@@ -6,6 +6,9 @@ import (
 	"github.com/flashbots/go-boost-utils/bls"
 )
 
+// DomainTypeBuilderRequestAuth is DOMAIN_BUILDER_REQUEST_AUTH.
+var DomainTypeBuilderRequestAuth = phase0.DomainType{0x0b, 0x00, 0x00, 0x01}
+
 // Verify checks the proposers signature on a request auth.
 func Verify(signed *builderApiGloas.SignedBuilderRequestAuth, pubkey phase0.BLSPubKey, domain phase0.Domain) (bool, error) {
 	if signed == nil || signed.Message == nil {
