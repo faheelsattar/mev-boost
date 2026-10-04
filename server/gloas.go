@@ -145,6 +145,52 @@ func (m *BoostService) handleGetExecutionPayloadBid(w http.ResponseWriter, req *
 	respondRelayResponse(w, params.PathGetExecutionPayloadBid, resp)
 }
 
+func (m *BoostService) handleSubmitBuilderPreferences(w http.ResponseWriter, req *http.Request) {
+	proposerPubkey := mux.Vars(req)["proposer_pubkey"]
+	log := m.log.WithFields(logrus.Fields{
+		"method":         "submitBuilderPreferences",
+		"proposerPubkey": proposerPubkey,
+		"ua":             req.Header.Get(HeaderUserAgent),
+	})
+	log.Debug("handling request")
+
+	prefs := new(builderApiGloas.BuilderPreferencesRequest)
+	body, contentType, code, err := decodeGloasRequest(req, prefs)
+	if err != nil {
+		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, code, err)
+		return
+	}
+	if err := validatePreferences(prefs); err != nil {
+		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, http.StatusBadRequest, err)
+		return
+	}
+	currentSlot := phase0.Slot((uint64(time.Now().Unix()) - m.genesisTime) / config.SlotTimeSec)
+	// prefs for a slot that has already passed are stale
+	if prefs.Auth.Message.Slot < currentSlot {
+		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, http.StatusBadRequest, errAuthSlotPassed)
+		return
+	}
+	relay, code, err := m.authorizeGloasRequest(proposerPubkey, prefs.Auth)
+	if err != nil {
+		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, code, err)
+		return
+	}
+	log = log.WithFields(logrus.Fields{
+		"relay":               relay.RelayEntry.String(),
+		"slot":                prefs.Auth.Message.Slot,
+		"maxExecutionPayment": prefs.Preferences.MaxExecutionPayment,
+	})
+
+	path := fmt.Sprintf("/eth/v1/builder/builder_preferences/%s", proposerPubkey)
+	resp := m.forwardGloasRequest(log, &m.httpClientRegVal, relay.RelayEntry, params.PathSubmitBuilderPreferences, path, body, gloasForwardHeader(req, contentType), m.httpClientRegVal.Timeout)
+	if resp == nil {
+		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, http.StatusBadGateway, errNoSuccessfulRelayResponse)
+		return
+	}
+	log.WithField("statusCode", resp.status).Info("forwarded builder preferences")
+	respondRelayResponse(w, params.PathSubmitBuilderPreferences, resp)
+}
+
 // decodeGloasRequest checks the consensus version header and decodes the body.
 func decodeGloasRequest(req *http.Request, dst gloasBody) (body []byte, contentType string, code int, err error) {
 	if req.Header.Get(HeaderEthConsensusVersion) != EthConsensusVersionGloas {
@@ -184,6 +230,13 @@ func validateAuth(auth *builderApiGloas.SignedBuilderRequestAuth) error {
 		return gloasAPI.ErrAuthDataTooLarge
 	}
 	return nil
+}
+
+func validatePreferences(req *builderApiGloas.BuilderPreferencesRequest) error {
+	if req == nil || req.Preferences == nil {
+		return gloasAPI.ErrNilMessage
+	}
+	return validateAuth(req.Auth)
 }
 
 // authorizeGloasRequest finds the relay the request is addressed to and verifies the proposers signature.
@@ -343,11 +396,9 @@ func logExecutionPayloadBid(log *logrus.Entry, relay types.RelayEntry, resp *rel
 		log.WithError(err).Warn("could not decode bid from relay")
 		return
 	}
-	total := bid.Message.Value + bid.Message.ExecutionPayment
-	if total < bid.Message.Value {
-		total = ^phase0.Gwei(0)
-	}
-	RecordBidValue(relay.URL.Hostname(), float64(total)/1e9)
+
+	totalGwei := float64(bid.Message.Value) + float64(bid.Message.ExecutionPayment)
+	RecordBidValue(relay.URL.Hostname(), totalGwei/1e9)
 	RecordRelayLastSlot(relay.URL.Hostname(), uint64(bid.Message.Slot))
 	log.WithFields(logrus.Fields{
 		"blockHash":            bid.Message.BlockHash.String(),
