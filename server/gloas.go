@@ -74,11 +74,12 @@ func (m *BoostService) handleGetExecutionPayloadBid(w http.ResponseWriter, req *
 		return
 	}
 	slot := phase0.Slot(slotValue)
+	// checks that both values are exactly 32 bytes long.
 	if len(parentHashHex) != 66 || len(parentRootHex) != 66 {
 		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadRequest, errInvalidHash)
 		return
 	}
-	deadline, err := requestDeadline(req.Header)
+	deadline, err := parseRequestDeadline(req.Header)
 	if err != nil {
 		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadRequest, err)
 		return
@@ -123,15 +124,17 @@ func (m *BoostService) handleGetExecutionPayloadBid(w http.ResponseWriter, req *
 
 	path := fmt.Sprintf("/eth/v1/builder/execution_payload_bid/%d/%s/%s/%s", slot, parentHashHex, parentRootHex, proposerPubkey)
 	header := gloasForwardHeader(req, contentType)
-	send := func(timeout time.Duration) *relayResponse {
-		return m.forwardGloasRequest(log, &m.httpClientGetHeader, relay.RelayEntry, params.PathGetExecutionPayloadBid, path, body, header, timeout)
+	ctx, cancel := context.WithDeadline(req.Context(), deadline)
+	defer cancel()
+	send := func(ctx context.Context) *relayResponse {
+		return m.forwardGloasRequest(ctx, log, &m.httpClientGetHeader, relay.RelayEntry, params.PathGetExecutionPayloadBid, path, body, header)
 	}
 
 	var resp *relayResponse
 	if relay.EnableTimingGames {
-		resp = pollUntilDeadline(relay, slotStart, deadline, send)
+		resp = pollUntilDeadline(ctx, relay, slotStart, send)
 	} else {
-		resp = send(time.Until(deadline))
+		resp = send(ctx)
 	}
 	if resp == nil {
 		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadGateway, errNoSuccessfulRelayResponse)
@@ -182,7 +185,9 @@ func (m *BoostService) handleSubmitBuilderPreferences(w http.ResponseWriter, req
 	})
 
 	path := fmt.Sprintf("/eth/v1/builder/builder_preferences/%s", proposerPubkey)
-	resp := m.forwardGloasRequest(log, &m.httpClientRegVal, relay.RelayEntry, params.PathSubmitBuilderPreferences, path, body, gloasForwardHeader(req, contentType), m.httpClientRegVal.Timeout)
+	ctx, cancel := context.WithTimeout(req.Context(), m.httpClientRegVal.Timeout)
+	defer cancel()
+	resp := m.forwardGloasRequest(ctx, log, &m.httpClientRegVal, relay.RelayEntry, params.PathSubmitBuilderPreferences, path, body, gloasForwardHeader(req, contentType))
 	if resp == nil {
 		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, http.StatusBadGateway, errNoSuccessfulRelayResponse)
 		return
@@ -227,9 +232,13 @@ func (m *BoostService) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req 
 	// we are forwarding the request to all the relays here just to avoid to store
 	// the relays whos bid was requested for and then somehow getting data lost in
 	// cache maybe due to restart. Only the relay whose bid won accepts it.
+	// forwards must outlive the handler, which returns on the first acceptance
+	ctx := context.WithoutCancel(req.Context())
 	for _, relay := range relays {
 		go func(relay types.RelayEntry) {
-			resp := m.forwardGloasRequest(log, &m.httpClientGetPayload, relay, params.PathSubmitSignedBeaconBlock, params.PathSubmitSignedBeaconBlock, body, header, m.httpClientGetPayload.Timeout)
+			ctx, cancel := context.WithTimeout(ctx, m.httpClientGetPayload.Timeout)
+			defer cancel()
+			resp := m.forwardGloasRequest(ctx, log, &m.httpClientGetPayload, relay, params.PathSubmitSignedBeaconBlock, params.PathSubmitSignedBeaconBlock, body, header)
 			accepted := resp != nil && resp.status == http.StatusAccepted
 			if resp != nil && !accepted {
 				log.WithFields(logrus.Fields{"relay": relay.String(), "statusCode": resp.status}).Debug("relay did not accept the block")
@@ -309,9 +318,9 @@ func (m *BoostService) authorizeGloasRequest(proposerPubkey string, auth *builde
 	m.relayConfigsLock.RUnlock()
 
 	var relay *types.RelayConfig
-	for i := range relayConfigs {
-		if relayConfigs[i].RelayEntry.AuthData == string(auth.Message.Data) {
-			relay = &relayConfigs[i]
+	for _, cfg := range relayConfigs {
+		if cfg.RelayEntry.AuthData == string(auth.Message.Data) {
+			relay = &cfg
 			break
 		}
 	}
@@ -330,9 +339,11 @@ func (m *BoostService) authorizeGloasRequest(proposerPubkey string, auth *builde
 }
 
 // forwardGloasRequest posts the body to the relay and returns its response
-func (m *BoostService) forwardGloasRequest(log *logrus.Entry, client *http.Client, relay types.RelayEntry, endpoint, path string, body []byte, header http.Header, timeout time.Duration) *relayResponse {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+func (m *BoostService) forwardGloasRequest(ctx context.Context, log *logrus.Entry, client *http.Client, relay types.RelayEntry, endpoint, path string, body []byte, header http.Header) *relayResponse {
+	timeout := client.Timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
 
 	url := relay.GetURI(path)
 	log = log.WithField("url", url)
@@ -373,8 +384,9 @@ func (m *BoostService) forwardGloasRequest(log *logrus.Entry, client *http.Clien
 }
 
 // pollUntilDeadline implements timing games for a relay, it waits for the configured first request
-// time, then requests repeatedly until the deadline and returns the most recently sent successful response.
-func pollUntilDeadline(relay types.RelayConfig, slotStart, deadline time.Time, send func(time.Duration) *relayResponse) *relayResponse {
+// time, then requests repeatedly until the context deadline and returns the most recently sent successful response.
+func pollUntilDeadline(ctx context.Context, relay types.RelayConfig, slotStart time.Time, send func(context.Context) *relayResponse) *relayResponse {
+	deadline, _ := ctx.Deadline()
 	if relay.TargetFirstRequestMs > 0 {
 		target := slotStart.Add(time.Duration(relay.TargetFirstRequestMs) * time.Millisecond)
 		// target still in future and before the deadline.
@@ -382,11 +394,15 @@ func pollUntilDeadline(relay types.RelayConfig, slotStart, deadline time.Time, s
 		// cuz it will send the req to the relay/builder with a near zero budget.
 		// maybe we can add a min budget floor later....
 		if target.Before(deadline) && time.Now().Before(target) {
-			time.Sleep(time.Until(target))
+			select {
+			case <-time.After(time.Until(target)):
+			case <-ctx.Done():
+				return nil
+			}
 		}
 	}
 	if relay.FrequencyGetHeaderMs == 0 {
-		return send(time.Until(deadline))
+		return send(ctx)
 	}
 
 	var (
@@ -399,11 +415,7 @@ func pollUntilDeadline(relay types.RelayConfig, slotStart, deadline time.Time, s
 	poll := func() {
 		defer wg.Done()
 		sent := time.Now()
-		remaining := deadline.Sub(sent)
-		if remaining <= 0 {
-			return
-		}
-		resp := send(remaining)
+		resp := send(ctx)
 		if resp == nil {
 			return
 		}
@@ -423,8 +435,6 @@ func pollUntilDeadline(relay types.RelayConfig, slotStart, deadline time.Time, s
 	go poll()
 	ticker := time.NewTicker(frequency)
 	defer ticker.Stop()
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
 	for {
 		select {
 		case <-ticker.C:
@@ -432,7 +442,7 @@ func pollUntilDeadline(relay types.RelayConfig, slotStart, deadline time.Time, s
 				wg.Add(1)
 				go poll()
 			}
-		case <-timer.C:
+		case <-ctx.Done():
 			wg.Wait()
 			if latest != nil {
 				return latest
@@ -499,8 +509,8 @@ func gloasForwardHeader(req *http.Request, contentType string) http.Header {
 	return header
 }
 
-// requestDeadline returns the proposers deadline, Date-Milliseconds + X-Timeout-Ms.
-func requestDeadline(header http.Header) (time.Time, error) {
+// parseRequestDeadline returns the proposers deadline, Date-Milliseconds + X-Timeout-Ms.
+func parseRequestDeadline(header http.Header) (time.Time, error) {
 	date, err := strconv.ParseInt(header.Get(HeaderDateMilliseconds), 10, 64)
 	if err != nil {
 		return time.Time{}, errMissingTimingHeaders
