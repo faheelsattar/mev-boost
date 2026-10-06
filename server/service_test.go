@@ -1939,7 +1939,7 @@ func blindedBlockToBlockResponse(signedBlock any, version spec.DataVersion) *bui
 			Version: spec.DataVersionFulu,
 			Fulu:    fuluExecutionPayloadAndBlobsBundle(header, commitments),
 		}
-	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair:
+	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionGloas:
 		panic("unknown data version")
 	}
 	return nil
@@ -2079,7 +2079,7 @@ func TestGetPayloadForks(t *testing.T) {
 				payload = block.Electra
 			case spec.DataVersionFulu:
 				payload = block.Fulu
-			case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair:
+			case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionGloas:
 				require.Fail(t, "unsupported version")
 			}
 

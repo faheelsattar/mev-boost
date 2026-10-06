@@ -40,8 +40,8 @@ var (
 )
 
 type gloasBody interface {
-	UnmarshalSSZ([]byte) error
-	UnmarshalJSON([]byte) error
+	UnmarshalSSZ(data []byte) error
+	UnmarshalJSON(data []byte) error
 }
 
 type relayResponse struct {
@@ -146,7 +146,7 @@ func (m *BoostService) handleGetExecutionPayloadBid(w http.ResponseWriter, req *
 	} else {
 		log.WithField("statusCode", resp.status).Info("no bid from relay")
 	}
-	respondRelayResponse(w, params.PathGetExecutionPayloadBid, resp)
+	respondRelayResponse(w, log, params.PathGetExecutionPayloadBid, resp)
 }
 
 func (m *BoostService) handleSubmitBuilderPreferences(w http.ResponseWriter, req *http.Request) {
@@ -194,7 +194,7 @@ func (m *BoostService) handleSubmitBuilderPreferences(w http.ResponseWriter, req
 		return
 	}
 	log.WithField("statusCode", resp.status).Info("forwarded builder preferences")
-	respondRelayResponse(w, params.PathSubmitBuilderPreferences, resp)
+	respondRelayResponse(w, log, params.PathSubmitBuilderPreferences, resp)
 }
 
 func (m *BoostService) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req *http.Request) {
@@ -480,7 +480,7 @@ func logExecutionPayloadBid(log *logrus.Entry, relay types.RelayEntry, resp *rel
 	}).Info("bid received")
 }
 
-func respondRelayResponse(w http.ResponseWriter, endpoint string, resp *relayResponse) {
+func respondRelayResponse(w http.ResponseWriter, log *logrus.Entry, endpoint string, resp *relayResponse) {
 	IncrementBeaconNodeStatus(strconv.Itoa(resp.status), endpoint)
 	if resp.contentType != "" {
 		w.Header().Set(HeaderContentType, resp.contentType)
@@ -492,7 +492,9 @@ func respondRelayResponse(w http.ResponseWriter, endpoint string, resp *relayRes
 	}
 	w.WriteHeader(resp.status)
 	if len(resp.body) > 0 {
-		w.Write(resp.body)
+		if _, err := w.Write(resp.body); err != nil {
+			log.WithError(err).Error("error writing response")
+		}
 	}
 }
 
