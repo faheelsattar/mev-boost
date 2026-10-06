@@ -163,19 +163,19 @@ func MergeRelayConfigs(relays []types.RelayEntry, configMap map[string]types.Rel
 	return configs, nil
 }
 
-func relayConfigFromYAML(relay RelayConfigYAML) (types.RelayConfig, error) {
+func relayConfigFromYAML(relay RelayConfigYAML) (*types.RelayConfig, error) {
 	relayEntry, err := types.NewRelayEntry(strings.TrimSpace(relay.URL))
 	if err != nil {
-		return types.RelayConfig{}, err
+		return nil, err
 	}
 	if relay.AuthData != "" {
 		authData, err := gloas.ParseAuthData(relay.AuthData)
 		if err != nil {
-			return types.RelayConfig{}, fmt.Errorf("relay %s: invalid auth_data: %w", relayEntry.String(), err)
+			return nil, fmt.Errorf("relay %s: invalid auth_data: %w", relayEntry.String(), err)
 		}
 		relayEntry.AuthData = string(authData)
 	}
-	return types.RelayConfig{
+	return &types.RelayConfig{
 		RelayEntry:           relayEntry,
 		EnableTimingGames:    relay.EnableTimingGames,
 		TargetFirstRequestMs: relay.TargetFirstRequestMs,
@@ -200,7 +200,7 @@ func parseConfig(cfg Config) (*ConfigResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		configMap[relayConfig.RelayEntry.String()] = relayConfig
+		configMap[relayConfig.RelayEntry.String()] = *relayConfig
 	}
 
 	// parse mux entries
@@ -214,7 +214,7 @@ func parseConfig(cfg Config) (*ConfigResult, error) {
 				if err != nil {
 					return nil, err
 				}
-				relayConfigs = append(relayConfigs, relayConfig)
+				relayConfigs = append(relayConfigs, *relayConfig)
 			}
 
 			// per mux timeouts if provieded otherwsie fall back to global defaults
