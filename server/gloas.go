@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -453,14 +454,17 @@ func pollUntilDeadline(ctx context.Context, relay types.RelayConfig, slotStart t
 }
 
 func logExecutionPayloadBid(log *logrus.Entry, relay types.RelayEntry, resp *relayResponse) {
-	bid := new(gloas.SignedExecutionPayloadBid)
+	var bid *gloas.SignedExecutionPayloadBid
 	var err error
 	if contentType, _, _ := mime.ParseMediaType(resp.contentType); contentType == MediaTypeOctetStream {
+		bid = new(gloas.SignedExecutionPayloadBid)
 		err = bid.UnmarshalSSZ(resp.body)
 	} else {
-		err = bid.UnmarshalJSON(resp.body)
+		var wrapped gloasAPI.ExecutionPayloadBidResponse
+		err = json.Unmarshal(resp.body, &wrapped)
+		bid = wrapped.Data
 	}
-	if err != nil || bid.Message == nil {
+	if err != nil || bid == nil || bid.Message == nil {
 		log.WithError(err).Warn("could not decode bid from relay")
 		return
 	}
