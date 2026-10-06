@@ -78,8 +78,8 @@ func NewRelayEntry(relayURL string) (entry RelayEntry, err error) {
 		return entry, ErrPointAtInfinityPubkey
 	}
 
-	// relays hostname is defaulted as the auth_data. This is overriden by a
-	// value that was agreed by the relay and is already set in the YAML config.
+	// The relay hostname is used as the default auth_data. This is overridden by a
+	// value agreed with the relay and set in the YAML config.
 	authData, err := gloas.DefaultAuthData(entry.URL.String())
 	if err != nil {
 		return entry, err

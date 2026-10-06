@@ -2,7 +2,7 @@ package params
 
 const (
 	// Router paths
-	// we will be depreciating them in favor of the new gloas builder-api
+	// These paths will be deprecated in favor of the new Gloas builder-api.
 	PathStatus            = "/eth/v1/builder/status"
 	PathRegisterValidator = "/eth/v1/builder/validators"
 	PathGetHeader         = "/eth/v1/builder/header/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}"
