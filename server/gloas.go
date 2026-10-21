@@ -348,7 +348,10 @@ func (m *BoostService) authorizeGloasRequest(proposerPubkey string, auth *builde
 func (m *BoostService) forwardGloasRequest(ctx context.Context, log *logrus.Entry, client *http.Client, relay types.RelayEntry, endpoint, path string, body []byte, header http.Header) *relayResponse {
 	timeout := client.Timeout
 	if deadline, ok := ctx.Deadline(); ok {
-		timeout = time.Until(deadline)
+		remaining := time.Until(deadline)
+		if timeout <= 0 || remaining < timeout {
+			timeout = remaining
+		}
 	}
 
 	url := relay.GetURI(path)

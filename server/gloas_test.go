@@ -243,8 +243,25 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 		require.Greater(t, fwdTimeout, 400)
 	})
 
+	t.Run("advertised timeout never exceeds the relay client timeout", func(t *testing.T) {
+		backend := newTestBackend(t, 1, 300*time.Millisecond)
+		relay := backend.relays[0]
+		auth := proposer.signAuth(t, []byte(relay.RelayEntry.AuthData), 1)
+
+		var fwdTimeout int
+		relay.OverrideHandleGetExecutionPayloadBid(func(w http.ResponseWriter, req *http.Request) {
+			fwdTimeout, _ = strconv.Atoi(req.Header.Get(HeaderTimeoutMs))
+			w.WriteHeader(http.StatusNoContent)
+		})
+
+		rr := backend.requestBytes(t, http.MethodPost, bidPath(1, proposer.pubkey), gloasHeader(MediaTypeJSON, "", 1000), mustJSON(t, auth))
+		require.Equal(t, http.StatusNoContent, rr.Code)
+		require.LessOrEqual(t, fwdTimeout, 300)
+		require.Greater(t, fwdTimeout, 250)
+	})
+
 	t.Run("deadline is capped at late_in_slot_time_ms into the slot", func(t *testing.T) {
-		backend := newTestBackend(t, 1, time.Second) // slot 1 starts now, late_in_slot_time_ms is 2000
+		backend := newTestBackend(t, 1, 3*time.Second) // slot 1 starts now, late_in_slot_time_ms is 2000
 		relay := backend.relays[0]
 		auth := proposer.signAuth(t, []byte(relay.RelayEntry.AuthData), 1)
 
