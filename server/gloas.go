@@ -143,7 +143,9 @@ func (m *BoostService) handleGetExecutionPayloadBid(w http.ResponseWriter, req *
 		resp = send(ctx)
 	}
 	if resp == nil {
-		m.respondGloasError(w, log, params.PathGetExecutionPayloadBid, http.StatusBadGateway, errNoSuccessfulRelayResponse)
+		log.Warn("no response from relay, not returning a bid")
+		IncrementBeaconNodeStatus(strconv.Itoa(http.StatusNoContent), params.PathGetExecutionPayloadBid)
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if resp.status == http.StatusOK {
@@ -195,7 +197,7 @@ func (m *BoostService) handleSubmitBuilderPreferences(w http.ResponseWriter, req
 	defer cancel()
 	resp := m.forwardGloasRequest(ctx, log, &m.httpClientRegVal, relay.RelayEntry, params.PathSubmitBuilderPreferences, path, body, gloasForwardHeader(req, contentType))
 	if resp == nil {
-		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, http.StatusBadGateway, errNoSuccessfulRelayResponse)
+		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, http.StatusInternalServerError, errNoSuccessfulRelayResponse)
 		return
 	}
 	log.WithField("statusCode", resp.status).Info("forwarded builder preferences")
@@ -261,7 +263,7 @@ func (m *BoostService) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req 
 			return
 		}
 	}
-	m.respondGloasError(w, log, params.PathSubmitSignedBeaconBlock, http.StatusBadGateway, errNoSuccessfulRelayResponse)
+	m.respondGloasError(w, log, params.PathSubmitSignedBeaconBlock, http.StatusInternalServerError, errNoSuccessfulRelayResponse)
 }
 
 // decodeGloasRequest checks the consensus version header and decodes the body.
@@ -523,17 +525,23 @@ func gloasForwardHeader(req *http.Request, contentType string) http.Header {
 	return header
 }
 
-// parseRequestDeadline returns the proposers deadline, Date-Milliseconds + X-Timeout-Ms.
+// parseRequestDeadline returns the proposers deadline, Date-Milliseconds + X-Timeout-Ms,
+// but no later than X-Timeout-Ms from now in case the proposers clock runs ahead.
 func parseRequestDeadline(header http.Header) (time.Time, error) {
 	date, err := strconv.ParseInt(header.Get(HeaderDateMilliseconds), 10, 64)
 	if err != nil {
 		return time.Time{}, errMissingTimingHeaders
 	}
-	timeout, err := strconv.ParseInt(header.Get(HeaderTimeoutMs), 10, 64)
-	if err != nil || timeout <= 0 {
+	timeoutMs, err := strconv.ParseInt(header.Get(HeaderTimeoutMs), 10, 64)
+	if err != nil || timeoutMs <= 0 {
 		return time.Time{}, errMissingTimingHeaders
 	}
-	return time.UnixMilli(date + timeout), nil
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	deadline := time.UnixMilli(date).Add(timeout)
+	if latest := time.Now().Add(timeout); latest.Before(deadline) {
+		deadline = latest
+	}
+	return deadline, nil
 }
 
 func requestContentType(header http.Header) (string, error) {

@@ -149,7 +149,7 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 		require.Equal(t, 0, backend.relays[2].GetRequestCount(bidPath(1, proposer.pubkey)))
 	})
 
-	t.Run("relay 204 and 400 are passed through, 5xx becomes 502", func(t *testing.T) {
+	t.Run("relay 204 and 400 are passed through, 5xx and no response become 204", func(t *testing.T) {
 		backend := newTestBackend(t, 1, time.Second)
 		relay := backend.relays[0]
 		auth := proposer.signAuth(t, []byte(relay.RelayEntry.AuthData), 1)
@@ -168,11 +168,11 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 
 		relay.OverrideHandleGetExecutionPayloadBid(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
 		rr = backend.requestBytes(t, http.MethodPost, bidPath(1, proposer.pubkey), gloasHeader(MediaTypeJSON, "", 500), body)
-		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, http.StatusNoContent, rr.Code)
 
 		relay.Server.Close()
 		rr = backend.requestBytes(t, http.MethodPost, bidPath(1, proposer.pubkey), gloasHeader(MediaTypeJSON, "", 500), body)
-		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, http.StatusNoContent, rr.Code)
 	})
 
 	t.Run("request validation", func(t *testing.T) {
@@ -258,6 +258,26 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 		require.Equal(t, http.StatusNoContent, rr.Code)
 		require.LessOrEqual(t, fwdTimeout, 300)
 		require.Greater(t, fwdTimeout, 250)
+	})
+
+	t.Run("deadline never exceeds X-Timeout-Ms from now when the proposer clock runs ahead", func(t *testing.T) {
+		backend := newTestBackend(t, 1, time.Second)
+		relay := backend.relays[0]
+		auth := proposer.signAuth(t, []byte(relay.RelayEntry.AuthData), 1)
+		// stamped 300ms in the future with a 500ms timeout: the relay still gets at most 500ms
+		header := gloasHeader(MediaTypeJSON, "", 500)
+		header.Set(HeaderDateMilliseconds, strconv.FormatInt(time.Now().Add(300*time.Millisecond).UnixMilli(), 10))
+
+		var fwdTimeout int
+		relay.OverrideHandleGetExecutionPayloadBid(func(w http.ResponseWriter, req *http.Request) {
+			fwdTimeout, _ = strconv.Atoi(req.Header.Get(HeaderTimeoutMs))
+			w.WriteHeader(http.StatusNoContent)
+		})
+
+		rr := backend.requestBytes(t, http.MethodPost, bidPath(1, proposer.pubkey), header, mustJSON(t, auth))
+		require.Equal(t, http.StatusNoContent, rr.Code)
+		require.LessOrEqual(t, fwdTimeout, 450)
+		require.Greater(t, fwdTimeout, 400)
 	})
 
 	t.Run("deadline is capped at late_in_slot_time_ms into the slot", func(t *testing.T) {
@@ -394,7 +414,7 @@ func TestSubmitSignedBeaconBlock(t *testing.T) {
 		require.Equal(t, block, received)
 	})
 
-	t.Run("502 when no relay accepts", func(t *testing.T) {
+	t.Run("500 when no relay accepts", func(t *testing.T) {
 		backend := newTestBackend(t, 2, time.Second)
 		for _, relay := range backend.relays {
 			relay.OverrideHandleSubmitSignedBeaconBlock(func(w http.ResponseWriter, _ *http.Request) {
@@ -402,7 +422,7 @@ func TestSubmitSignedBeaconBlock(t *testing.T) {
 			})
 		}
 		rr := backend.requestBytes(t, http.MethodPost, params.PathSubmitSignedBeaconBlock, gloasHeader(MediaTypeJSON, "", 500), block)
-		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, http.StatusInternalServerError, rr.Code)
 	})
 
 	t.Run("request validation", func(t *testing.T) {
