@@ -21,7 +21,6 @@ require (
 
 require (
 	github.com/bits-and-blooms/bitset v1.22.0 // indirect
-	github.com/casbin/govaluate v1.10.0 // indirect
 	github.com/consensys/bavard v0.1.30 // indirect
 	github.com/consensys/gnark-crypto v0.17.0 // indirect
 	github.com/crate-crypto/go-ipa v0.0.0-20240724233137-53bbb0ceb27a // indirect
@@ -34,8 +33,8 @@ require (
 	github.com/gofrs/flock v0.12.1 // indirect
 	github.com/mmcloughlin/addchain v0.4.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
-	github.com/pk910/dynamic-ssz v1.3.2 // indirect
-	github.com/pk910/hashtree-bindings v0.2.2 // indirect
+	github.com/pk910/dynamic-ssz v1.4.0 // indirect
+	github.com/pk910/hashtree-bindings v0.2.6 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
 	github.com/sourcegraph/conc v0.3.1-0.20240121214520-5f936abd7ae8 // indirect
@@ -54,8 +53,8 @@ require (
 )
 
 require (
-	github.com/attestantio/go-builder-client v0.8.0
-	github.com/attestantio/go-eth2-client v0.29.1-0.20260909121132-513bdd4bdbcd
+	github.com/attestantio/go-builder-client v0.9.1
+	github.com/attestantio/go-eth2-client v0.30.2
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/ferranbt/fastssz v0.1.4 // indirect
@@ -78,5 +77,3 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1
 )
-
-replace github.com/attestantio/go-builder-client => github.com/faheelsattar/go-builder-client v0.0.0-20261001230051-f5198c9b6ab6
