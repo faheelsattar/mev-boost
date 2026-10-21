@@ -29,6 +29,10 @@ import (
 // Gloas (ePBS) builder API. Each request is forwarded unchanged to the one relay whose
 // auth data matches the request, and the relay's response is passed back.
 
+// bidDeadlineMargin is taken off the deadline handed to the relay so its
+// response still reaches the beacon node in time.
+const bidDeadlineMargin = 50 * time.Millisecond
+
 var (
 	errGloasConsensusVersion = errors.New("Eth-Consensus-Version header must be gloas")
 	errMissingTimingHeaders  = errors.New("missing or invalid Date-Milliseconds or X-Timeout-Ms header")
@@ -114,7 +118,8 @@ func (m *BoostService) handleGetExecutionPayloadBid(w http.ResponseWriter, req *
 	_, _, lateInSlotTimeMs := m.GetConfigForValidator(proposerPubkey)
 	m.relayConfigsLock.RUnlock()
 	slotStart := time.Unix(int64(m.genesisTime+uint64(slot)*config.SlotTimeSec), 0)
-	deadline = time.UnixMilli(min(deadline.UnixMilli(), slotStart.UnixMilli()+int64(lateInSlotTimeMs)))
+	deadline = time.UnixMilli(min(deadline.UnixMilli(), slotStart.UnixMilli()+int64(lateInSlotTimeMs))).Add(-bidDeadlineMargin)
+	log.WithField("timeoutMs", time.Until(deadline).Milliseconds()).Debug("bid deadline")
 
 	if time.Until(deadline) <= 0 {
 		log.Warn("proposer deadline already passed, not requesting a bid")
