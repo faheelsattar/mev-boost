@@ -26,10 +26,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// Gloas (ePBS) builder API. Each request is forwarded unchanged to the one relay whose
-// auth data matches the request, and the relay's response is passed back.
+// Gloas (ePBS) builder API. Each request is forwarded unchanged to the one builder whose
+// auth data matches the request, and the builder's response is passed back.
 
-// bidDeadlineMargin is taken off the deadline handed to the relay so its
+// bidDeadlineMargin is taken off the deadline handed to the builder so its
 // response still reaches the beacon node in time.
 const bidDeadlineMargin = 50 * time.Millisecond
 
@@ -527,6 +527,7 @@ func gloasForwardHeader(req *http.Request, contentType string) http.Header {
 
 // parseRequestDeadline returns the proposers deadline, Date-Milliseconds + X-Timeout-Ms,
 // but no later than X-Timeout-Ms from now in case the proposers clock runs ahead.
+// X-Timeout-Ms is capped at one slot, a bid is never useful for longer than that.
 func parseRequestDeadline(header http.Header) (time.Time, error) {
 	date, err := strconv.ParseInt(header.Get(HeaderDateMilliseconds), 10, 64)
 	if err != nil {
@@ -536,6 +537,7 @@ func parseRequestDeadline(header http.Header) (time.Time, error) {
 	if err != nil || timeoutMs <= 0 {
 		return time.Time{}, errMissingTimingHeaders
 	}
+	timeoutMs = min(timeoutMs, int64(config.SlotTimeSec)*1000)
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	deadline := time.UnixMilli(date).Add(timeout)
 	if latest := time.Now().Add(timeout); latest.Before(deadline) {

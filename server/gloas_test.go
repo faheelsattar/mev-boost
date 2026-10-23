@@ -1,12 +1,15 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,7 +19,9 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/ssz"
+	"github.com/flashbots/mev-boost/config"
 	"github.com/flashbots/mev-boost/server/params"
+	"github.com/flashbots/mev-boost/server/types"
 	gloasAPI "github.com/flashbots/mev-boost/server/types/gloas"
 	"github.com/stretchr/testify/require"
 )
@@ -319,10 +324,11 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 		rr := backend.requestBytes(t, http.MethodPost, bidPath(1, proposer.pubkey), gloasHeader(MediaTypeJSON, "", 300), mustJSON(t, auth))
 		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 		count := relay.GetRequestCount(bidPath(1, proposer.pubkey))
-		require.Greater(t, count, 1)
+		require.Greater(t, count, 2)
 		var bid gloasAPI.ExecutionPayloadBidResponse
 		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &bid))
-		require.Equal(t, phase0.Gwei(count), bid.Data.Message.Value, "the last poll's bid must be returned")
+		require.GreaterOrEqual(t, bid.Data.Message.Value, phase0.Gwei(count-1), "the latest poll's bid must be returned")
+		require.LessOrEqual(t, bid.Data.Message.Value, phase0.Gwei(count))
 	})
 }
 
@@ -448,6 +454,151 @@ func TestValidateGloasRequest(t *testing.T) {
 	require.NoError(t, validatePreferences(&builderApiGloas.BuilderPreferencesRequest{Preferences: &builderApiGloas.BuilderPreferences{}, Auth: auth}))
 	require.ErrorIs(t, validatePreferences(&builderApiGloas.BuilderPreferencesRequest{Auth: auth}), gloasAPI.ErrNilMessage)
 	require.ErrorIs(t, validatePreferences(&builderApiGloas.BuilderPreferencesRequest{Preferences: &builderApiGloas.BuilderPreferences{}}), gloasAPI.ErrNilMessage)
+}
+
+func TestParseRequestDeadline(t *testing.T) {
+	slot := time.Duration(config.SlotTimeSec) * time.Second
+	header := func(date time.Time, timeoutMs int64) http.Header {
+		h := http.Header{}
+		h.Set(HeaderDateMilliseconds, strconv.FormatInt(date.UnixMilli(), 10))
+		h.Set(HeaderTimeoutMs, strconv.FormatInt(timeoutMs, 10))
+		return h
+	}
+
+	deadline, err := parseRequestDeadline(header(time.Now(), 1000))
+	require.NoError(t, err)
+	require.WithinDuration(t, time.Now().Add(time.Second), deadline, 50*time.Millisecond)
+
+	for _, timeoutMs := range []int64{999_999_999, math.MaxInt64} {
+		deadline, err = parseRequestDeadline(header(time.Now(), timeoutMs))
+		require.NoError(t, err)
+		require.WithinDuration(t, time.Now().Add(slot), deadline, 50*time.Millisecond)
+	}
+}
+
+func TestPollUntilDeadline(t *testing.T) {
+	ok := func(n int32) *relayResponse {
+		return &relayResponse{status: http.StatusOK, body: []byte(strconv.Itoa(int(n)))}
+	}
+	noBid := &relayResponse{status: http.StatusNoContent}
+	timingGames := func(targetMs, frequencyMs uint64) types.RelayConfig {
+		return types.RelayConfig{EnableTimingGames: true, TargetFirstRequestMs: targetMs, FrequencyGetHeaderMs: frequencyMs}
+	}
+
+	t.Run("without a frequency waits for the target and sends once", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		slotStart := time.Now()
+		var calls atomic.Int32
+		var sentAt time.Time
+		resp := pollUntilDeadline(ctx, timingGames(100, 0), slotStart, func(context.Context) *relayResponse {
+			sentAt = time.Now()
+			return ok(calls.Add(1))
+		})
+		require.Equal(t, ok(1), resp)
+		require.Equal(t, int32(1), calls.Load())
+		require.GreaterOrEqual(t, sentAt.Sub(slotStart), 100*time.Millisecond)
+	})
+
+	t.Run("a target that has passed or is after the deadline is not waited for", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			slotStart time.Time
+			targetMs  uint64
+		}{
+			"target passed":         {slotStart: time.Now().Add(-time.Second), targetMs: 100},
+			"target after deadline": {slotStart: time.Now(), targetMs: 500},
+		} {
+			t.Run(name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				defer cancel()
+				start := time.Now()
+				var sentAt time.Time
+				resp := pollUntilDeadline(ctx, timingGames(tc.targetMs, 0), tc.slotStart, func(context.Context) *relayResponse {
+					sentAt = time.Now()
+					return ok(1)
+				})
+				require.Equal(t, ok(1), resp)
+				require.Less(t, sentAt.Sub(start), 50*time.Millisecond)
+			})
+		}
+	})
+
+	t.Run("cancelled while waiting for the target returns nil without sending", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		time.AfterFunc(50*time.Millisecond, cancel)
+		var calls atomic.Int32
+		resp := pollUntilDeadline(ctx, timingGames(500, 50), time.Now(), func(context.Context) *relayResponse {
+			return ok(calls.Add(1))
+		})
+		require.Nil(t, resp)
+		require.Equal(t, int32(0), calls.Load())
+	})
+
+	t.Run("a slow earlier poll does not replace a newer bid", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+		defer cancel()
+		var calls atomic.Int32
+		resp := pollUntilDeadline(ctx, timingGames(0, 50), time.Now(), func(context.Context) *relayResponse {
+			n := calls.Add(1)
+			if n == 1 {
+				time.Sleep(250 * time.Millisecond)
+			}
+			return ok(n)
+		})
+		require.Greater(t, calls.Load(), int32(2))
+		require.Equal(t, ok(calls.Load()), resp)
+	})
+
+	t.Run("a bid wins over a later non-200 response", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		var calls atomic.Int32
+		resp := pollUntilDeadline(ctx, timingGames(0, 50), time.Now(), func(context.Context) *relayResponse {
+			if n := calls.Add(1); n == 1 {
+				return ok(n)
+			}
+			return noBid
+		})
+		require.Greater(t, calls.Load(), int32(1))
+		require.Equal(t, ok(1), resp)
+	})
+
+	t.Run("without a bid returns the non-200 response, or nil without any response", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			sent     *relayResponse
+			expected *relayResponse
+		}{
+			"non-200":     {sent: noBid, expected: noBid},
+			"no response": {sent: nil, expected: nil},
+		} {
+			t.Run(name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+				defer cancel()
+				resp := pollUntilDeadline(ctx, timingGames(0, 50), time.Now(), func(context.Context) *relayResponse { return tc.sent })
+				require.Equal(t, tc.expected, resp)
+			})
+		}
+	})
+
+	t.Run("no poll starts within one frequency of the deadline", func(t *testing.T) {
+		const frequency = 50 * time.Millisecond
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		deadline, _ := ctx.Deadline()
+		var mu sync.Mutex
+		var sentAt []time.Time
+		pollUntilDeadline(ctx, timingGames(0, uint64(frequency.Milliseconds())), time.Now(), func(context.Context) *relayResponse {
+			mu.Lock()
+			sentAt = append(sentAt, time.Now())
+			mu.Unlock()
+			return ok(1)
+		})
+		require.Greater(t, len(sentAt), 2)
+		for _, sent := range sentAt {
+			require.Greater(t, deadline.Sub(sent), frequency-5*time.Millisecond)
+		}
+	})
 }
 
 func TestGloasEndpointsAreAdditive(t *testing.T) {
