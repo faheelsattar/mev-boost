@@ -175,7 +175,10 @@ func (m *BoostService) handleSubmitBuilderPreferences(w http.ResponseWriter, req
 		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, http.StatusBadRequest, err)
 		return
 	}
-	currentSlot := phase0.Slot((uint64(time.Now().Unix()) - m.genesisTime) / config.SlotTimeSec)
+	var currentSlot phase0.Slot
+	if now := uint64(time.Now().Unix()); now > m.genesisTime {
+		currentSlot = phase0.Slot((now - m.genesisTime) / config.SlotTimeSec)
+	}
 	// prefs for a slot that has already passed are stale
 	if prefs.Auth.Message.Slot < currentSlot {
 		m.respondGloasError(w, log, params.PathSubmitBuilderPreferences, http.StatusBadRequest, errAuthSlotPassed)
@@ -349,6 +352,9 @@ func (m *BoostService) authorizeGloasRequest(proposerPubkey string, auth *builde
 // forwardGloasRequest posts the body to the relay and returns its response
 func (m *BoostService) forwardGloasRequest(ctx context.Context, log *logrus.Entry, client *http.Client, relay types.RelayEntry, endpoint, path string, body []byte, header http.Header) *relayResponse {
 	timeout := client.Timeout
+	if timeout > bidDeadlineMargin {
+		timeout -= bidDeadlineMargin
+	}
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if timeout <= 0 || remaining < timeout {
