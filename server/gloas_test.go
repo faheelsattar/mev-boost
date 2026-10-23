@@ -486,7 +486,7 @@ func TestPollUntilDeadline(t *testing.T) {
 	}
 
 	t.Run("without a frequency waits for the target and sends once", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
 		slotStart := time.Now()
 		var calls atomic.Int32
@@ -509,7 +509,7 @@ func TestPollUntilDeadline(t *testing.T) {
 			"target after deadline": {slotStart: time.Now(), targetMs: 500},
 		} {
 			t.Run(name, func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 				defer cancel()
 				start := time.Now()
 				var sentAt time.Time
@@ -524,7 +524,7 @@ func TestPollUntilDeadline(t *testing.T) {
 	})
 
 	t.Run("cancelled while waiting for the target returns nil without sending", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
 		time.AfterFunc(50*time.Millisecond, cancel)
 		var calls atomic.Int32
@@ -536,7 +536,7 @@ func TestPollUntilDeadline(t *testing.T) {
 	})
 
 	t.Run("a slow earlier poll does not replace a newer bid", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+		ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
 		defer cancel()
 		var calls atomic.Int32
 		resp := pollUntilDeadline(ctx, timingGames(0, 50), time.Now(), func(context.Context) *relayResponse {
@@ -551,7 +551,7 @@ func TestPollUntilDeadline(t *testing.T) {
 	})
 
 	t.Run("a bid wins over a later non-200 response", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 		defer cancel()
 		var calls atomic.Int32
 		resp := pollUntilDeadline(ctx, timingGames(0, 50), time.Now(), func(context.Context) *relayResponse {
@@ -573,7 +573,7 @@ func TestPollUntilDeadline(t *testing.T) {
 			"no response": {sent: nil, expected: nil},
 		} {
 			t.Run(name, func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+				ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
 				defer cancel()
 				resp := pollUntilDeadline(ctx, timingGames(0, 50), time.Now(), func(context.Context) *relayResponse { return tc.sent })
 				require.Equal(t, tc.expected, resp)
@@ -583,7 +583,7 @@ func TestPollUntilDeadline(t *testing.T) {
 
 	t.Run("no poll starts within one frequency of the deadline", func(t *testing.T) {
 		const frequency = 50 * time.Millisecond
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 		defer cancel()
 		deadline, _ := ctx.Deadline()
 		var mu sync.Mutex
